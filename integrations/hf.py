@@ -25,7 +25,9 @@ Blast radius on failure:
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Any, Optional
+
+import httpx
 
 from core.logging import get_logger
 
@@ -46,6 +48,19 @@ class HFSpacesClient:
         self._base_url = base_url.rstrip("/")
         self._api_token = api_token
         self._keepalive_task: Optional[asyncio.Task[None]] = None
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, connect=10.0),
+            )
+        return self._client
+
+    def _headers(self) -> dict[str, str]:
+        if self._api_token:
+            return {"Authorization": f"Bearer {self._api_token}"}
+        return {}
 
     # ── Core API ─────────────────────────────────────────────────────────
 
@@ -65,10 +80,24 @@ class HFSpacesClient:
         errors.  The ingest pipeline catches NotImplementedError and
         falls back to empty embedding + empty OCR text.
         """
-        raise NotImplementedError(
-            "HFSpacesClient.process_image() — implement me! "
-            "POST image_b64 to /process, return (embedding, ocr_text)."
+        client = self._get_client()
+        url = f"{self._base_url}/process"
+
+        response = await client.post(
+            url,
+            json={"image_b64": image_b64},
+            headers=self._headers(),
         )
+        response.raise_for_status()
+
+        data: dict[str, Any] = response.json()
+        embedding = data.get("embedding")
+        ocr_text = data.get("ocr_text", "")
+
+        if not isinstance(embedding, list):
+            raise ValueError("HF /process response missing embedding")
+
+        return embedding, str(ocr_text)
 
     async def embed_text(self, query: str) -> list[float]:
         """
@@ -86,10 +115,23 @@ class HFSpacesClient:
         router catches NotImplementedError and skips vector search
         entirely, falling back to text-only results.
         """
-        raise NotImplementedError(
-            "HFSpacesClient.embed_text() — implement me! "
-            "POST text to /embed_text, return normalised 512-dim vector."
+        client = self._get_client()
+        url = f"{self._base_url}/embed_text"
+
+        response = await client.post(
+            url,
+            json={"text": query},
+            headers=self._headers(),
         )
+        response.raise_for_status()
+
+        data: dict[str, Any] = response.json()
+        embedding = data.get("embedding")
+
+        if not isinstance(embedding, list):
+            raise ValueError("HF /embed_text response missing embedding")
+
+        return embedding
 
     # ── Keep-warm ────────────────────────────────────────────────────────
 
@@ -109,10 +151,24 @@ class HFSpacesClient:
         them.  If the keep-alive task itself crashes, the Space may
         go to sleep — ingest latency increases but nothing breaks.
         """
-        raise NotImplementedError(
-            "HFSpacesClient.start_keepalive() — implement me! "
-            "GET {base_url}/ every {interval}s in a loop."
-        )
+        if self._keepalive_task and not self._keepalive_task.done():
+            return
+
+        client = self._get_client()
+        url = f"{self._base_url}/"
+
+        async def _loop() -> None:
+            while True:
+                try:
+                    await client.get(url, headers=self._headers())
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.warning("hf_keepalive_failed", exc_info=True)
+                await asyncio.sleep(interval)
+
+        self._keepalive_task = asyncio.create_task(_loop())
+        log.info("hf_keepalive_started", interval=interval)
 
     async def stop_keepalive(self) -> None:
         """
@@ -138,4 +194,7 @@ class HFSpacesClient:
         On failure: logs but never raises — shutdown must complete.
         """
         await self.stop_keepalive()
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
         log.info("hf_client_closed")

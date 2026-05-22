@@ -42,8 +42,8 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # ── HF Spaces (friend implements the client) ─────────────────────────
-    HF_SPACES_URL: str = "https://placeholder.hf.space"
-    HF_API_TOKEN: str = ""
+    HF_SPACES_URL: str
+    HF_API_TOKEN: str
 
     # ── Tunable knobs ────────────────────────────────────────────────────
     INGEST_WORKER_COUNT: int = 3
