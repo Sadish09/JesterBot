@@ -5,10 +5,10 @@ Responsibility:
     Wires together all subsystems and runs the ordered startup sequence:
 
     1. Load config + configure logging
-    2. Connect Redis (fast, local Railway network)
-    3. Connect MongoDB (Atlas, ~100 ms)  [STUB]
-    4. Fetch embeddings → build FAISS index  [STUB — starts empty]
-    5. Start HF keep-warm ping  [STUB]
+    2. Connect Redis (optional — uses NoOpCache if REDIS_URL is empty)
+    3. Connect MongoDB (Atlas, ~100 ms)  [STUB — friend implements]
+    4. Fetch embeddings → build FAISS index  [STUB until MongoDB is live]
+    5. Start HF keep-warm ping
     6. Build ingest pipeline + worker pool
     7. Register slash commands + attach event handlers
     8. Start Discord bot + workers
@@ -30,11 +30,12 @@ from __future__ import annotations
 import asyncio
 import signal
 import time
+from typing import Union
 
 from bot.client import JesterBot
 from bot.commands import register_commands
 from bot.events import setup_events
-from cache.redis_client import RedisCache
+from cache.redis_client import NoOpCache, RedisCache
 from core.config import get_settings
 from core.logging import get_logger, setup_logging
 from ingest.downloader import close_client as close_httpx
@@ -48,6 +49,9 @@ from search.vector_search import FAISSIndex
 
 log = get_logger("main")
 
+# Union type for the cache — either Redis-backed or no-op
+Cache = Union[RedisCache, NoOpCache]
+
 
 async def main() -> None:
     """
@@ -59,7 +63,7 @@ async def main() -> None:
 
     On failure:
     - Config validation errors crash immediately (intentional).
-    - Redis connection failure crashes immediately (required).
+    - Redis connection failure logs a warning and falls back to NoOpCache.
     - MongoDB / HF stub failures are caught — bot starts degraded.
     - Discord login failure (bad token) crashes after cleanup.
     """
@@ -68,13 +72,28 @@ async def main() -> None:
     log.info("starting", env=settings.ENV)
     t0 = time.monotonic()
 
-    # ── 1. Redis ─────────────────────────────────────────────────────────
-    redis = RedisCache(
-        settings.REDIS_URL,
-        dedup_ttl_days=settings.DEDUP_TTL_DAYS,
-        query_ttl=settings.QUERY_CACHE_TTL,
-    )
-    await redis.connect()
+    # ── 1. Cache (Redis or NoOp) ─────────────────────────────────────────
+    cache: Cache
+    if settings.REDIS_URL:
+        try:
+            redis_cache = RedisCache(
+                settings.REDIS_URL,
+                dedup_ttl_days=settings.DEDUP_TTL_DAYS,
+                query_ttl=settings.QUERY_CACHE_TTL,
+            )
+            await redis_cache.connect()
+            cache = redis_cache
+        except Exception:
+            log.warning(
+                "redis_connect_failed",
+                detail="Could not connect to Redis — falling back to NoOpCache",
+                exc_info=True,
+            )
+            cache = NoOpCache()
+            await cache.connect()
+    else:
+        cache = NoOpCache()
+        await cache.connect()
 
     # ── 2. MongoDB (stub) ────────────────────────────────────────────────
     db = MongoDB(settings.MONGODB_URI)
@@ -83,7 +102,7 @@ async def main() -> None:
     except NotImplementedError:
         log.warning("mongodb_stub", detail="MongoDB connect() not implemented — continuing")
 
-    # ── 3. HF Spaces client (stub) ───────────────────────────────────────
+    # ── 3. HF Spaces client ──────────────────────────────────────────────
     hf = HFSpacesClient(settings.HF_SPACES_URL, api_token=settings.HF_API_TOKEN)
 
     # ── 4. FAISS index — rebuild from MongoDB ────────────────────────────
@@ -103,20 +122,17 @@ async def main() -> None:
             detail="MongoDB fetch_all_embeddings() not implemented — starting with empty index",
         )
 
-    # ── 5. HF keep-warm ping (stub) ─────────────────────────────────────
-    try:
-        await hf.start_keepalive(settings.HF_WARMUP_INTERVAL)
-    except NotImplementedError:
-        log.warning("hf_keepalive_stub", detail="HF keepalive not implemented — skipping")
+    # ── 5. HF keep-warm ping ─────────────────────────────────────────────
+    await hf.start_keepalive(settings.HF_WARMUP_INTERVAL)
 
     # ── 6. Ingest pipeline + worker pool ─────────────────────────────────
-    pipeline = IngestPipeline(redis=redis, db=db, hf=hf, faiss_index=faiss_index)
+    pipeline = IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
     queue = IngestQueue(pipeline)
 
     # ── 7. Build the Discord bot + register commands/events ──────────────
     text_search = TextSearch(db)
     search_router = SearchRouter(
-        redis=redis,
+        redis=cache,
         db=db,
         hf=hf,
         text_search=text_search,
@@ -153,6 +169,7 @@ async def main() -> None:
                 startup_ms=round((time.monotonic() - t0) * 1000, 1),
                 workers=settings.INGEST_WORKER_COUNT,
                 faiss_count=faiss_index.count,
+                cache=type(cache).__name__,
             )
             await bot.start(settings.DISCORD_TOKEN)
 
@@ -190,7 +207,7 @@ async def main() -> None:
         await db.close()
     except NotImplementedError:
         pass
-    await redis.close()
+    await cache.close()
     await close_httpx()
 
     if not bot.is_closed():

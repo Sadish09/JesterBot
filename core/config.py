@@ -38,8 +38,8 @@ class Settings(BaseSettings):
     # ── MongoDB (friend implements the client) ───────────────────────────
     MONGODB_URI: str = "mongodb://localhost:27017/jester"
 
-    # ── Redis ────────────────────────────────────────────────────────────
-    REDIS_URL: str = "redis://localhost:6379/0"
+    # ── Redis (optional — set to "" to disable caching) ────────────────
+    REDIS_URL: str = ""
 
     # ── HF Spaces (friend implements the client) ─────────────────────────
     HF_SPACES_URL: str

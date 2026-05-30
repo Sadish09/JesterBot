@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import time
 
-from cache.redis_client import RedisCache
+from cache.redis_client import NoOpCache, RedisCache
 from core.config import get_settings
 from core.logging import get_logger
 from core.models import SearchResult
@@ -55,7 +55,7 @@ class SearchRouter:
 
     def __init__(
         self,
-        redis: RedisCache,
+        redis: RedisCache | NoOpCache,
         db: MongoDB,
         hf: HFSpacesClient,
         text_search: TextSearch,
@@ -119,9 +119,11 @@ class SearchRouter:
         try:
             query_embedding = await self._hf.embed_text(q)
         except NotImplementedError:
+            # Safety net — HF embed_text is implemented but this catch
+            # remains in case the endpoint is temporarily misconfigured.
             log.warning(
-                "vector_search_stub",
-                detail="HF embed_text not implemented — cannot do vector search",
+                "embed_text_not_implemented",
+                detail="HF embed_text raised NotImplementedError — cannot do vector search",
             )
             return []
         except Exception:

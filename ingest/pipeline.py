@@ -26,7 +26,7 @@ import base64
 import time
 from typing import Optional
 
-from cache.redis_client import RedisCache
+from cache.redis_client import NoOpCache, RedisCache
 from core.config import get_settings
 from core.logging import get_logger
 from core.models import IngestJob, MemeDocument
@@ -51,7 +51,7 @@ class IngestPipeline:
 
     def __init__(
         self,
-        redis: RedisCache,
+        redis: RedisCache | NoOpCache,
         db: MongoDB,
         hf: HFSpacesClient,
         faiss_index: FAISSIndex,
@@ -128,10 +128,12 @@ class IngestPipeline:
         try:
             embedding, ocr_text = await self._hf.process_image(image_b64)
         except NotImplementedError:
+            # Safety net — HF is implemented but this catch remains
+            # in case the endpoint is temporarily misconfigured.
             log.warning(
-                "hf_stub_active",
+                "hf_not_implemented",
                 message_id=job.message_id,
-                detail="HF integration not implemented yet — using empty embedding/OCR",
+                detail="HF process_image raised NotImplementedError — using empty embedding/OCR",
             )
             settings = get_settings()
             embedding = [0.0] * settings.EMBEDDING_DIM

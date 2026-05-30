@@ -1,5 +1,5 @@
 """
-integrations/hf.py — HF Spaces client — STUB.
+integrations/hf.py — HF Spaces client.
 
 Responsibility:
     Async client for the combined CLIP + OCR HF Space.  Sends images to
@@ -8,9 +8,9 @@ Responsibility:
     embed_text() for converting search queries to vectors, and a
     keep-warm ping to prevent free-tier Spaces from sleeping.
 
-    YOUR FRIEND IMPLEMENTS THIS.  All methods currently raise
-    NotImplementedError.  The contracts below define the exact
-    signatures and expected behaviour.
+    Uses its own httpx.AsyncClient with a 60 s timeout (generous for
+    cold-start scenarios).  Authorisation via Bearer token if
+    HF_API_TOKEN is set.
 
 Blast radius on failure:
     HIGH.  If the HF Space is down or cold-starting:
@@ -39,7 +39,7 @@ class HFSpacesClient:
     HFSpacesClient(base_url, api_token) -> HFSpacesClient
 
     Async client for the combined CLIP + OCR HF Space.
-    All methods raise NotImplementedError until wired up.
+    Creates its own httpx.AsyncClient lazily on first use.
 
     On failure: construction never fails (just stores config).
     """
