@@ -9,14 +9,21 @@ Responsibility:
        TTL 5 min).  Only for text/string search hits — vector queries
        are too varied to cache.
 
+    When Redis is not configured (REDIS_URL is empty), the NoOpCache
+    drop-in replacement is used instead — same interface, every call
+    returns "cache miss" or is a no-op.  This lets the pipeline and
+    search router work identically without touching their code.
+
 Blast radius on failure:
-    MEDIUM.  If Redis is down on startup, the process crashes (connect()
-    raises).  If Redis goes down at runtime:
+    LOW–MEDIUM.  Redis is optional.  If Redis is configured and goes
+    down at runtime:
     - Dedup checks fail → duplicate memes get re-processed (wasted HF
       calls but no data corruption).
     - Query cache misses → every search hits Atlas/FAISS (slower but
       correct).
     The bot continues to function, just less efficiently.
+    If Redis is not configured at all, the bot runs fine — just without
+    caching.
 """
 
 from __future__ import annotations
@@ -24,12 +31,79 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-import redis.asyncio as aioredis
-
 from core.logging import get_logger
 from core.models import SearchResult
 
 log = get_logger("cache")
+
+
+class NoOpCache:
+    """
+    NoOpCache() -> NoOpCache
+
+    Drop-in replacement for RedisCache that does nothing.  Every read
+    returns None (cache miss), every write is silently dropped.  Used
+    when REDIS_URL is not configured.
+
+    On failure: never fails — all methods are no-ops.
+    """
+
+    async def connect(self) -> None:
+        """
+        connect() -> None
+
+        No-op.  Logs that caching is disabled.
+
+        On failure: never fails.
+        """
+        log.info("cache_disabled", detail="No Redis configured — running without cache")
+
+    async def close(self) -> None:
+        """
+        close() -> None
+
+        No-op.
+
+        On failure: never fails.
+        """
+
+    async def check_duplicate(self, phash: str) -> Optional[str]:
+        """
+        check_duplicate(phash: str) -> Optional[str]
+
+        Always returns None (not a duplicate).
+
+        On failure: never fails.
+        """
+        return None
+
+    async def mark_seen(self, phash: str, message_id: str) -> None:
+        """
+        mark_seen(phash: str, message_id: str) -> None
+
+        No-op — silently drops the write.
+
+        On failure: never fails.
+        """
+
+    async def get_search_results(self, query: str) -> Optional[list[SearchResult]]:
+        """
+        get_search_results(query: str) -> Optional[list[SearchResult]]
+
+        Always returns None (cache miss).
+
+        On failure: never fails.
+        """
+        return None
+
+    async def set_search_results(self, query: str, results: list[SearchResult]) -> None:
+        """
+        set_search_results(query: str, results: list[SearchResult]) -> None
+
+        No-op — silently drops the write.
+
+        On failure: never fails.
+        """
 
 
 class RedisCache:
@@ -47,7 +121,7 @@ class RedisCache:
         self._url = url
         self._dedup_ttl = dedup_ttl_days * 86_400  # convert to seconds
         self._query_ttl = query_ttl
-        self._redis: Optional[aioredis.Redis] = None
+        self._redis = None  # aioredis.Redis — imported lazily
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -59,9 +133,10 @@ class RedisCache:
         PING command.
 
         On failure: raises redis.ConnectionError if the server is
-        unreachable or the URL is malformed.  The process should abort
-        startup if this fails.
+        unreachable or the URL is malformed.
         """
+        import redis.asyncio as aioredis
+
         self._redis = aioredis.from_url(
             self._url,
             decode_responses=True,
@@ -69,7 +144,7 @@ class RedisCache:
         )
         # Quick health check
         await self._redis.ping()
-        log.info("redis_connected", url=self._url)
+        log.info("redis_connected")
 
     async def close(self) -> None:
         """
@@ -86,7 +161,7 @@ class RedisCache:
             log.info("redis_closed")
 
     @property
-    def _r(self) -> aioredis.Redis:
+    def _r(self):
         """
         _r -> aioredis.Redis
 
