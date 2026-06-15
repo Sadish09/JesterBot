@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     # ── Discord ──────────────────────────────────────────────────────────
     DISCORD_TOKEN: str
     DISCORD_MEME_CHANNEL_ID: int  # snowflake of the sendables channel
+    DISCORD_GUILD_ID: int = 0     # set for instant dev sync, 0 = global sync
 
     # ── MongoDB (friend implements the client) ───────────────────────────
     MONGODB_URI: str = "mongodb://localhost:27017/jester"

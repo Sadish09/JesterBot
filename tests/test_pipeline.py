@@ -33,9 +33,10 @@ def _make_png(w: int = 64, h: int = 64) -> bytes:
     return buf.getvalue()
 
 
-@pytest.fixture
-def mock_deps() -> tuple[NoOpCache, AsyncMock, AsyncMock, FAISSIndex]:
-    """Return (cache, mock_db, mock_hf, real_faiss)."""
+def _build_deps() -> tuple[NoOpCache, AsyncMock, AsyncMock, FAISSIndex]:
+    """Build a fresh set of mocked deps. Not a fixture — called directly
+    so tests that need both the pipeline and the raw deps get the SAME
+    instances."""
     cache = NoOpCache()
 
     db = AsyncMock(spec=MongoDB)
@@ -47,12 +48,6 @@ def mock_deps() -> tuple[NoOpCache, AsyncMock, AsyncMock, FAISSIndex]:
     faiss_index = FAISSIndex(dim=512)
 
     return cache, db, hf, faiss_index
-
-
-@pytest.fixture
-def pipeline(mock_deps: tuple) -> IngestPipeline:
-    cache, db, hf, faiss_index = mock_deps
-    return IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
 
 
 @pytest.fixture
@@ -68,11 +63,10 @@ def job() -> IngestJob:
 
 class TestPipelineHappyPath:
     @pytest.mark.asyncio
-    async def test_successful_ingest(
-        self, pipeline: IngestPipeline, job: IngestJob, mock_deps: tuple
-    ) -> None:
+    async def test_successful_ingest(self, job: IngestJob) -> None:
         """Full pipeline → returns MemeDocument, FAISS gets a vector."""
-        cache, db, hf, faiss_index = mock_deps
+        cache, db, hf, faiss_index = _build_deps()
+        pipeline = IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
         png_bytes = _make_png()
 
         with patch("ingest.pipeline.download_image", new_callable=AsyncMock) as dl:
@@ -92,11 +86,11 @@ class TestPipelineHappyPath:
 
 class TestPipelineDedup:
     @pytest.mark.asyncio
-    async def test_duplicate_skipped(self, job: IngestJob, mock_deps: tuple) -> None:
-        """If Redis says it's a dup, pipeline returns None immediately."""
+    async def test_duplicate_skipped(self, job: IngestJob) -> None:
+        """If cache says it's a dup, pipeline returns None immediately."""
+        cache, db, hf, faiss_index = _build_deps()
         cache_mock = AsyncMock(spec=NoOpCache)
         cache_mock.check_duplicate = AsyncMock(return_value="existing_msg_id")
-        _, db, hf, faiss_index = mock_deps
 
         pipeline = IngestPipeline(redis=cache_mock, db=db, hf=hf, faiss_index=faiss_index)
         png_bytes = _make_png()
@@ -113,17 +107,20 @@ class TestPipelineDedup:
 
 class TestPipelineFailures:
     @pytest.mark.asyncio
-    async def test_download_failure(self, pipeline: IngestPipeline, job: IngestJob) -> None:
+    async def test_download_failure(self, job: IngestJob) -> None:
         """Download exception → returns None, no side effects."""
+        cache, db, hf, faiss_index = _build_deps()
+        pipeline = IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
+
         with patch("ingest.pipeline.download_image", new_callable=AsyncMock) as dl:
             dl.side_effect = Exception("CDN timeout")
             doc = await pipeline.process(job)
         assert doc is None
 
     @pytest.mark.asyncio
-    async def test_hf_failure_returns_none(self, job: IngestJob, mock_deps: tuple) -> None:
+    async def test_hf_failure_returns_none(self, job: IngestJob) -> None:
         """HF raising a non-NotImplementedError → pipeline returns None."""
-        cache, db, hf, faiss_index = mock_deps
+        cache, db, hf, faiss_index = _build_deps()
         hf.process_image = AsyncMock(side_effect=RuntimeError("HF cold start"))
         pipeline = IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
 
@@ -133,9 +130,9 @@ class TestPipelineFailures:
         assert doc is None
 
     @pytest.mark.asyncio
-    async def test_hf_not_implemented_fallback(self, job: IngestJob, mock_deps: tuple) -> None:
+    async def test_hf_not_implemented_fallback(self, job: IngestJob) -> None:
         """HF NotImplementedError → zero embedding, empty OCR, pipeline continues."""
-        cache, db, hf, faiss_index = mock_deps
+        cache, db, hf, faiss_index = _build_deps()
         hf.process_image = AsyncMock(side_effect=NotImplementedError)
         pipeline = IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
 
@@ -149,22 +146,21 @@ class TestPipelineFailures:
         assert faiss_index.count == 1
 
     @pytest.mark.asyncio
-    async def test_db_failure_continues(self, job: IngestJob, mock_deps: tuple) -> None:
+    async def test_db_failure_returns_none(self, job: IngestJob) -> None:
         """DB write fails → pipeline returns None but doesn't crash workers."""
-        cache, db, hf, faiss_index = mock_deps
+        cache, db, hf, faiss_index = _build_deps()
         db.upsert_meme = AsyncMock(side_effect=RuntimeError("Mongo down"))
         pipeline = IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
 
         with patch("ingest.pipeline.download_image", new_callable=AsyncMock) as dl:
             dl.return_value = _make_png()
             doc = await pipeline.process(job)
-        # DB failure returns None (line 170 in pipeline.py)
         assert doc is None
 
     @pytest.mark.asyncio
-    async def test_db_not_implemented_continues(self, job: IngestJob, mock_deps: tuple) -> None:
+    async def test_db_not_implemented_continues(self, job: IngestJob) -> None:
         """DB stub NotImplementedError → pipeline skips write but finishes."""
-        cache, db, hf, faiss_index = mock_deps
+        cache, db, hf, faiss_index = _build_deps()
         db.upsert_meme = AsyncMock(side_effect=NotImplementedError)
         pipeline = IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
 
@@ -173,13 +169,18 @@ class TestPipelineFailures:
             doc = await pipeline.process(job)
 
         assert doc is not None
-        assert faiss_index.count == 1  # FAISS still got the vector
+        assert faiss_index.count == 1
 
 
 class TestPipelineImageTooLarge:
     @pytest.mark.asyncio
-    async def test_oversized_image(self, pipeline: IngestPipeline, job: IngestJob) -> None:
+    async def test_oversized_image(self, job: IngestJob) -> None:
+        """ImageTooLargeError → returns None cleanly."""
         from ingest.downloader import ImageTooLargeError
+
+        cache, db, hf, faiss_index = _build_deps()
+        pipeline = IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
+
         with patch("ingest.pipeline.download_image", new_callable=AsyncMock) as dl:
             dl.side_effect = ImageTooLargeError("too big")
             doc = await pipeline.process(job)

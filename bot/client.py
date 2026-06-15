@@ -75,16 +75,31 @@ class JesterBot(discord.Client):
         setup_hook() -> None
 
         Called once by discord.py before the bot connects to the
-        gateway.  Syncs the command tree (slash commands must already
-        be registered via register_commands() in main.py).
+        gateway.  Syncs the command tree to a specific guild (instant)
+        when DISCORD_GUILD_ID is set, or globally (up to 1 hour
+        propagation) when it's 0.
 
-        On failure: raises discord.HTTPException if the Discord API
-        rejects the command sync (e.g. rate limited, invalid command
-        definitions).  The bot still connects but slash commands won't
-        work until the next successful sync.
+        On failure: logs a warning but does NOT crash the bot.  Slash
+        commands won't be available until the next successful sync,
+        but the bot still connects and ingests memes.
         """
-        await self.tree.sync()
-        log.info("slash_commands_synced")
+        from core.config import get_settings
+
+        try:
+            settings = get_settings()
+            if settings.DISCORD_GUILD_ID:
+                guild = discord.Object(id=settings.DISCORD_GUILD_ID)
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                log.info("slash_commands_synced", mode="guild", guild_id=settings.DISCORD_GUILD_ID)
+            else:
+                await self.tree.sync()
+                log.info("slash_commands_synced", mode="global")
+        except Exception:
+            log.exception(
+                "slash_command_sync_failed",
+                detail="Bot will start but commands may not be available — retry on next restart",
+            )
 
     async def on_ready(self) -> None:
         """
