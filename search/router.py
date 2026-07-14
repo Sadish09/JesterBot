@@ -1,16 +1,18 @@
 """
-search/router.py — Two-phase search router with early exit.
+search/router.py — Multi-phase search router with caption-first fast path.
 
 Responsibility:
     Unified search entry-point used by the /find slash command.
-    Implements the three-phase search strategy from the plan:
+    Implements a four-phase search strategy with early exit:
 
-    Phase 1 — Redis query cache    (instant on hit)
-    Phase 2 — Atlas text search    (< 200 ms target)
-    Phase 3 — FAISS vector search  (< 1.5 s target, includes HF embed round-trip)
+    Phase 0 — Caption index      (instant, in-memory substring match)
+    Phase 1 — Redis query cache   (instant on hit)
+    Phase 2 — Atlas text search   (< 200 ms target)
+    Phase 3 — FAISS vector search (< 1.5 s target, includes HF embed round-trip)
 
-    Short queries (< 3 chars) skip Phase 2 — string matching on 1-2
-    char queries returns noise.
+    Phase 0 catches snake_case caption matches like "doge_meme" before
+    touching any external service.  Short queries (< 3 chars) skip
+    Phase 2 — string matching on 1-2 char queries returns noise.
 
     Vector search results are NOT cached — queries are too varied for
     a meaningful hit rate.
@@ -19,6 +21,7 @@ Blast radius on failure:
     MEDIUM.  If the entire router fails (unexpected exception), the
     /find command shows an error message to the user.  If individual
     phases fail:
+    - Caption index miss → falls through to Redis cache
     - Redis cache miss → falls through to text search (slightly slower)
     - Text search fails → falls through to vector search
     - Vector search fails → returns empty results
@@ -35,6 +38,7 @@ from core.logging import get_logger
 from core.models import SearchResult
 from integrations.db import MongoDB
 from integrations.hf import HFSpacesClient
+from search.caption_index import CaptionIndex
 from search.text_search import TextSearch
 from search.vector_search import FAISSIndex
 
@@ -45,7 +49,7 @@ _SHORT_QUERY_THRESHOLD = 3  # skip text search for queries shorter than this
 
 class SearchRouter:
     """
-    SearchRouter(redis, db, hf, text_search, faiss_index) -> SearchRouter
+    SearchRouter(redis, db, hf, text_search, faiss_index, caption_index) -> SearchRouter
 
     Unified search entry-point.  All dependencies are injected via
     constructor — no global state.
@@ -60,12 +64,14 @@ class SearchRouter:
         hf: HFSpacesClient,
         text_search: TextSearch,
         faiss_index: FAISSIndex,
+        caption_index: CaptionIndex | None = None,
     ) -> None:
         self._redis = redis
         self._db = db
         self._hf = hf
         self._text = text_search
         self._faiss = faiss_index
+        self._captions = caption_index
 
     async def search(self, query: str, k: int | None = None) -> list[SearchResult]:
         """
@@ -75,6 +81,7 @@ class SearchRouter:
         (defaults to SEARCH_TOP_K from config), falling through phases
         until we get hits.
 
+        Phase 0: Caption index (in-memory) → return immediately on hit
         Phase 1: Check Redis query cache → return immediately on hit
         Phase 2: Atlas text search (skip if query < 3 chars) → cache and return on hit
         Phase 3: FAISS vector search → embed query via HF, search index, fetch docs
@@ -88,6 +95,20 @@ class SearchRouter:
         k = k or settings.SEARCH_TOP_K
         q = query.strip()
         t0 = time.monotonic()
+
+        # ── Phase 0: Caption index (in-memory, instant) ──────────────────
+        if self._captions and self._captions.count > 0:
+            t_cap = time.monotonic()
+            caption_hits = self._captions.search(q, limit=k)
+            if caption_hits:
+                log.info(
+                    "search_caption_hit",
+                    query=q,
+                    count=len(caption_hits),
+                    ms=_ms(t_cap),
+                )
+                return caption_hits
+            log.debug("search_caption_miss", query=q, ms=_ms(t_cap))
 
         # ── Phase 1: Redis query cache ───────────────────────────────────
         cached = await self._redis.get_search_results(q)

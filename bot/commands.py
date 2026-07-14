@@ -3,9 +3,9 @@ bot/commands.py — Slash commands (/find, /status).
 
 Responsibility:
     Registers slash commands on the bot's command tree.  /find defers
-    the response immediately (Discord gives 3 seconds before the
-    interaction token expires), runs the search router, and edits the
-    deferred message with a rich embed of results.  /status is a
+    the response ephemerally (only visible to the invoker), runs the
+    search router, and shows results with interactive "Send" buttons.
+    The user picks a meme and the bot sends it publicly.  /status is a
     quick health check showing ready state and queue depth.
 
     Command registration is called from main.py before bot.start() to
@@ -26,8 +26,8 @@ from typing import TYPE_CHECKING
 import discord
 from discord import app_commands
 
+from bot.views import MemePickerView, build_picker_embeds
 from core.logging import get_logger
-from core.models import SearchResult
 
 if TYPE_CHECKING:
     from bot.client import JesterBot
@@ -58,8 +58,9 @@ def register_commands(bot: discord.Client) -> None:
         find(interaction, query: str) -> None
 
         Search the meme archive using the multi-phase search router.
-        Defers the response immediately to avoid Discord's 3-second
-        interaction timeout, then edits with results.
+        Results are shown ephemerally (only visible to the invoker)
+        with interactive "Send" buttons.  The user picks a meme and
+        the bot sends it publicly to the channel.
 
         On failure:
         - Sends an ephemeral error message to the user if the search
@@ -68,8 +69,8 @@ def register_commands(bot: discord.Client) -> None:
           startup.
         - Never crashes the bot — all exceptions are caught.
         """
-        # Defer immediately — we might need > 3 s for vector search
-        await interaction.response.defer(thinking=True)
+        # Defer ephemerally — only the invoker sees the "thinking..." state
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
         if not bot.ready_flag:  # type: ignore[attr-defined]
             await interaction.followup.send(
@@ -81,7 +82,7 @@ def register_commands(bot: discord.Client) -> None:
         log.info("find_invoked", user=str(interaction.user), query=query)
 
         try:
-            results = await bot.search_router.search(query)  # type: ignore[attr-defined]
+            results = await bot.search_router.search(query, k=3)  # type: ignore[attr-defined]
         except Exception:
             log.exception("find_search_error", query=query)
             await interaction.followup.send(
@@ -93,13 +94,25 @@ def register_commands(bot: discord.Client) -> None:
         if not results:
             await interaction.followup.send(
                 f"🔍 No memes found for **{query}**. Try a different search?",
+                ephemeral=True,
             )
             return
 
-        # Build a rich embed with the top results
-        embed = _build_results_embed(query, results)
-        await interaction.followup.send(embed=embed)
-        log.info("find_responded", query=query, count=len(results))
+        # Build ephemeral picker with embeds and buttons
+        embeds = build_picker_embeds(results, query)
+        view = MemePickerView(
+            results=results,
+            query=query,
+            invoker_id=interaction.user.id,
+        )
+
+        await interaction.followup.send(
+            content=f"🔍 **Results for: {query}** — pick one to send!",
+            embeds=embeds,
+            view=view,
+            ephemeral=True,
+        )
+        log.info("find_picker_shown", query=query, count=len(results))
 
     @bot.tree.command(name="status", description="Bot health check")  # type: ignore[attr-defined]
     async def status(interaction: discord.Interaction) -> None:
@@ -123,38 +136,3 @@ def register_commands(bot: discord.Client) -> None:
             inline=True,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-def _build_results_embed(query: str, results: list[SearchResult]) -> discord.Embed:
-    """
-    _build_results_embed(query: str, results: list[SearchResult]) -> discord.Embed
-
-    Build a Discord embed showing search results.  Displays up to 5
-    results with score, text preview, and the first result's image as
-    the embed image.
-
-    On failure: never fails — operates on pure data.  If a result has
-    an empty image_url, the embed simply has no image.
-    """
-    embed = discord.Embed(
-        title=f"🔍 Results for: {query}",
-        color=discord.Color.blurple(),
-    )
-
-    for i, r in enumerate(results[:5], start=1):
-        # Truncate searchable text for the embed field
-        text_preview = (r.searchable_text[:80] + "…") if len(r.searchable_text) > 80 else r.searchable_text
-        score_str = f" (score: {r.score:.2f})" if r.score > 0 else ""
-
-        embed.add_field(
-            name=f"#{i}{score_str}",
-            value=text_preview or "_no text_",
-            inline=False,
-        )
-
-    # Show the first result's image as the embed thumbnail
-    if results and results[0].image_url:
-        embed.set_image(url=results[0].image_url)
-
-    embed.set_footer(text=f"Showing top {min(len(results), 5)} results")
-    return embed

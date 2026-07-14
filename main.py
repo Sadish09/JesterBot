@@ -43,6 +43,7 @@ from ingest.pipeline import IngestPipeline
 from ingest.queue import IngestQueue
 from integrations.db import MongoDB
 from integrations.hf import HFSpacesClient
+from search.caption_index import CaptionIndex
 from search.router import SearchRouter
 from search.text_search import TextSearch
 from search.vector_search import FAISSIndex
@@ -125,11 +126,17 @@ async def main() -> None:
     # ── 5. HF keep-warm ping ─────────────────────────────────────────────
     await hf.start_keepalive(settings.HF_WARMUP_INTERVAL)
 
-    # ── 6. Ingest pipeline + worker pool ─────────────────────────────────
-    pipeline = IngestPipeline(redis=cache, db=db, hf=hf, faiss_index=faiss_index)
+    # ── 6. Caption index (in-memory) ──────────────────────────────────
+    caption_index = CaptionIndex()
+
+    # ── 7. Ingest pipeline + worker pool ─────────────────────────────────
+    pipeline = IngestPipeline(
+        redis=cache, db=db, hf=hf, faiss_index=faiss_index,
+        caption_index=caption_index,
+    )
     queue = IngestQueue(pipeline)
 
-    # ── 7. Build the Discord bot + register commands/events ──────────────
+    # ── 8. Build the Discord bot + register commands/events ──────────────
     text_search = TextSearch(db)
     search_router = SearchRouter(
         redis=cache,
@@ -137,6 +144,7 @@ async def main() -> None:
         hf=hf,
         text_search=text_search,
         faiss_index=faiss_index,
+        caption_index=caption_index,
     )
 
     bot = JesterBot(

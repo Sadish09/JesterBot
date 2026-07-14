@@ -2,6 +2,7 @@
 tests/test_router.py — Search router phase logic.
 
 Catches:
+- Caption hit → returns immediately (phase 0)
 - Cache hit → returns immediately (phase 1)
 - Text search hit → caches + returns (phase 2)
 - Short query bypass → skips text search
@@ -19,6 +20,7 @@ import pytest
 
 from cache.redis_client import NoOpCache
 from core.models import SearchResult
+from search.caption_index import CaptionIndex
 from search.router import SearchRouter
 from search.text_search import TextSearch
 from search.vector_search import FAISSIndex
@@ -41,6 +43,7 @@ def mock_components() -> dict:
     text_search.search = AsyncMock(return_value=[])
 
     faiss_index = FAISSIndex(dim=512)
+    caption_index = CaptionIndex()
 
     return {
         "cache": cache,
@@ -48,6 +51,7 @@ def mock_components() -> dict:
         "hf": hf,
         "text_search": text_search,
         "faiss_index": faiss_index,
+        "caption_index": caption_index,
     }
 
 
@@ -59,6 +63,7 @@ def router(mock_components: dict) -> SearchRouter:
         hf=mock_components["hf"],
         text_search=mock_components["text_search"],
         faiss_index=mock_components["faiss_index"],
+        caption_index=mock_components["caption_index"],
     )
 
 
@@ -67,6 +72,43 @@ def sample_results() -> list[SearchResult]:
     return [
         SearchResult(message_id="1", image_url="x", searchable_text="doge", score=0.9),
     ]
+
+
+class TestPhase0CaptionHit:
+    @pytest.mark.asyncio
+    async def test_caption_hit_returns_immediately(
+        self, mock_components: dict, sample_results: list[SearchResult]
+    ) -> None:
+        """Caption match → returns immediately, skips all other phases."""
+        caption_index = mock_components["caption_index"]
+        caption_index.add("msg1", "http://img/1.png", "doge_meme")
+
+        router = SearchRouter(
+            redis=mock_components["cache"],
+            db=mock_components["db"],
+            hf=mock_components["hf"],
+            text_search=mock_components["text_search"],
+            faiss_index=mock_components["faiss_index"],
+            caption_index=caption_index,
+        )
+
+        results = await router.search("doge meme")
+        assert len(results) == 1
+        assert results[0].message_id == "msg1"
+        # All other phases should be skipped
+        mock_components["cache"].get_search_results.assert_not_awaited()
+        mock_components["text_search"].search.assert_not_awaited()
+        mock_components["hf"].embed_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_caption_miss_falls_through(
+        self, router: SearchRouter, mock_components: dict
+    ) -> None:
+        """No caption match → falls through to Phase 1+."""
+        results = await router.search("nonexistent query")
+        # Should have tried the cache at minimum
+        mock_components["cache"].get_search_results.assert_awaited_once()
+
 
 
 class TestPhase1CacheHit:

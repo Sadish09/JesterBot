@@ -4,8 +4,9 @@ ingest/pipeline.py — Full ingest flow from raw image to indexed meme.
 Responsibility:
     Orchestrates the complete ingest pipeline for a single image:
     download → pHash → dedup check → HF Spaces (CLIP + OCR) → MongoDB
-    upsert → FAISS index update → Redis mark-seen.  Each step is
-    individually timed so you can spot bottlenecks in logs.
+    upsert → FAISS index update → caption index update → Redis
+    mark-seen.  Each step is individually timed so you can spot
+    bottlenecks in logs.
 
     Designed to be called from queue workers.  Never blocks the Discord
     event loop — all I/O is async, CPU-bound pHash runs in an executor.
@@ -34,6 +35,7 @@ from ingest.downloader import ImageTooLargeError, download_image
 from ingest.fingerprint import compute_phash
 from integrations.db import MongoDB
 from integrations.hf import HFSpacesClient
+from search.caption_index import CaptionIndex
 from search.vector_search import FAISSIndex
 
 log = get_logger("ingest.pipeline")
@@ -41,9 +43,9 @@ log = get_logger("ingest.pipeline")
 
 class IngestPipeline:
     """
-    IngestPipeline(redis, db, hf, faiss_index) -> IngestPipeline
+    IngestPipeline(redis, db, hf, faiss_index, caption_index) -> IngestPipeline
 
-    Orchestrates: download → hash → dedup → HF → MongoDB → FAISS.
+    Orchestrates: download → hash → dedup → HF → MongoDB → FAISS → captions.
     Stateless — all dependencies are injected via constructor.
 
     On failure: construction never fails (just stores references).
@@ -55,11 +57,13 @@ class IngestPipeline:
         db: MongoDB,
         hf: HFSpacesClient,
         faiss_index: FAISSIndex,
+        caption_index: CaptionIndex | None = None,
     ) -> None:
         self._redis = redis
         self._db = db
         self._hf = hf
         self._faiss = faiss_index
+        self._captions = caption_index
 
     async def process(self, job: IngestJob) -> Optional[MemeDocument]:
         """
@@ -176,6 +180,10 @@ class IngestPipeline:
         t_faiss = time.monotonic()
         self._faiss.add(embedding, job.message_id)
         log.info("step_faiss_add", message_id=job.message_id, ms=_ms(t_faiss))
+
+        # ── Step 7.5: Caption index ──────────────────────────────────────
+        if self._captions and doc.caption:
+            self._captions.add(doc.message_id, doc.image_url, doc.caption)
 
         # ── Step 8: Mark seen in Redis ───────────────────────────────────
         await self._redis.mark_seen(img_hash, job.message_id)
